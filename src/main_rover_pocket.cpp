@@ -101,6 +101,12 @@
 #define AGX_TX_PIN        33    // ESP32 TX → AGX RX (reserved for future)
 #define AGX_BAUD      115200
 
+// ─── MIXER MODE ─────────────────────────────────────────────────────
+// 0 = Asymmetric: outer wheel stays at throttle, only inner wheel slows
+// 1 = Scaled yaw: standard mixer with reduced yaw sensitivity
+#define MIXER_MODE        0
+#define YAW_SCALE         0.5f    // only used when MIXER_MODE = 1
+
 // Set to 1 if your relay module energises on HIGH; 0 for active-LOW boards.
 #define RELAY_ACTIVE_HIGH 1
 
@@ -253,8 +259,34 @@ static Outputs computeOutputs(int ch3, int ch1, int ch5,
     yaw      = normalizeStick(ch1);
   }
 
-  float left  = constrain(throttle + yaw, -1.0f, 1.0f);
-  float right = constrain(throttle - yaw, -1.0f, 1.0f);
+  float left, right;
+
+#if MIXER_MODE == 0
+  // Asymmetric: outer wheel = throttle, inner wheel slows toward zero
+  if (throttle == 0.0f && yaw != 0.0f)
+  {
+    left  = yaw;
+    right = -yaw;
+  }
+  else if (yaw >= 0.0f)
+  {
+    left  = throttle;
+    right = throttle - yaw * (throttle >= 0.0f ? 1.0f : -1.0f);
+  }
+  else
+  {
+    left  = throttle + yaw * (throttle >= 0.0f ? 1.0f : -1.0f);
+    right = throttle;
+  }
+#else
+  // Scaled yaw: standard differential mixer with reduced turn rate
+  float scaledYaw = yaw * YAW_SCALE;
+  left  = throttle + scaledYaw;
+  right = throttle - scaledYaw;
+#endif
+
+  left  = constrain(left,  -1.0f, 1.0f);
+  right = constrain(right, -1.0f, 1.0f);
 
   o.dacLeft    = (uint16_t)(fabsf(left)  * 4095.0f);
   o.dacRight   = (uint16_t)(fabsf(right) * 4095.0f);
