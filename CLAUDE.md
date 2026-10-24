@@ -82,19 +82,31 @@ Note: PlatformIO CLI may not be in PATH. Use full path if needed: `~/.platformio
 
 ### Differential Mixer
 
-```
-Inputs:  throttle (-1.0 to +1.0), yaw (-1.0 to +1.0)
-         — from CRSF sticks (manual) or AGX serial packets (auto)
+Two selectable modes controlled by `#define MIXER_MODE` (0 or 1):
 
-Left  = clamp(throttle + yaw, -1.0, +1.0)
-Right = clamp(throttle - yaw, -1.0, +1.0)
-Sign → direction relay (negative = reverse)
-|magnitude| × 4095 → DAC value (0–3.3V)
+**Mode 0 — Asymmetric (default):** Outer wheel stays at throttle, only inner wheel slows. Wider turning radius, outer wheel never overspeeds. Spin-in-place preserved when throttle = 0.
+
 ```
+Driving + turning:
+  Right turn (yaw > 0): left = throttle, right = throttle - yaw × sign(throttle)
+  Left turn  (yaw < 0): left = throttle + yaw × sign(throttle), right = throttle
+
+Spin in place (throttle = 0):
+  left = +yaw, right = -yaw   (standard symmetric)
+```
+
+**Mode 1 — Scaled Yaw:** Standard differential mixer with reduced yaw sensitivity. Turn rate controlled by `#define YAW_SCALE` (0.0–1.0, default 0.5).
+
+```
+left  = throttle + yaw × YAW_SCALE
+right = throttle - yaw × YAW_SCALE
+```
+
+Both modes: sign → direction relay, |magnitude| × 4095 → DAC value (0–3.3V)
 
 ## AGX Serial Bridge (Autonomous Mode)
 
-Status: **ESP32 side implemented** in `main_rover_pocket.cpp`. AGX bridge node not yet written.
+Status: **ESP32 side implemented** in `main_rover_pocket.cpp`. **Bridge node implemented** in `~/ros2_ws/src/rover_bridge/` — tested on RPi5, portable to AGX.
 
 ### What's Implemented (ESP32 Side)
 
@@ -166,6 +178,7 @@ Both layers are independent. Even if the bridge crashes, the ESP32 watchdog catc
 - All safe defaults: brakes ON, DACs zero, relays OFF, LED OFF
 - AGX serial: `$CMD,<throttle>,<yaw>\n` on Serial1, 115200 baud, 500ms watchdog
 - Arm logic: `ch8 > SWITCH_THRESH` = armed (inverted from original Zorro firmware)
+- Mixer mode: `MIXER_MODE 0` = asymmetric (default), `1` = scaled yaw (`YAW_SCALE 0.5`)
 
 ## GitHub
 
@@ -185,7 +198,7 @@ Both layers are independent. Even if the bridge crashes, the ESP32 watchdog catc
 
 - [x] Manual control firmware — complete, tested with RadioMaster Pocket
 - [x] Autonomous ESP32 firmware (AGX serial parser, watchdog, source select) — implemented, compiles clean
-- [ ] ROS2 bridge node on AGX
+- [x] ROS2 bridge node — implemented (`~/ros2_ws/src/rover_bridge/`), tested on RPi5, portable to AGX
 - [ ] Hardware assembly with final circuit
 - [ ] Calibration (max_speed, max_yaw_rate)
 - [ ] End-to-end autonomous test
