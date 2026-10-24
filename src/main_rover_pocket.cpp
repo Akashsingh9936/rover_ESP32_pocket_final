@@ -1,9 +1,10 @@
 /*
-  ROVER — Differential Turning + Safety Features (RadioMaster Pocket)
-  ====================================================================
+  ROVER — Manual + Autonomous Control (RadioMaster Pocket)
+  =========================================================
   Hardware : ESP32 DevKitV1 + MCP4922 dual 12-bit SPI DAC
   Receiver : RadioMaster RP1 (ExpressLRS)
   TX       : RadioMaster Pocket
+  Autonomy: NVIDIA Jetson AGX via Serial1 (UART)
   Motors   : driven by a KLE motor driver per side.
              Each KLE channel takes:
                - speed input   : 0 – 3.3 V analog (from MCP4922)
@@ -25,11 +26,15 @@
     MCP4922 VOUTA →  KLE LEFT  speed input
     MCP4922 VOUTB →  KLE RIGHT speed input
 
-    GPIO32 →  LEFT  direction relay
-    GPIO19 →  RIGHT direction relay
-    GPIO33 →  LEFT  brake relay    (⚠ strapping pin — see note)
-    GPIO4 →  RIGHT brake relay
-    GPIO25 →  LED relay
+    GPIO27 →  LEFT  direction relay
+    GPIO25 →  RIGHT direction relay
+    GPIO13 →  LEFT  brake relay
+    GPIO26 →  RIGHT brake relay
+    GPIO14 →  LED relay
+
+    AGX TX  →  ESP32 GPIO4  (RX1)
+    AGX RX  →  ESP32 GPIO33 (TX1)  [reserved for future ESP→AGX feedback]
+    AGX GND →  ESP32 GND
 
   ⚠ GPIO12 is a strapping pin. It must be LOW during boot or the ESP32
   may fail to start. Ensure the relay module does not pull GPIO12 HIGH at
@@ -44,10 +49,20 @@
   CH9  — dead man's switch (manual only): 191 = released, 1792 = pressed
 
   ─── Mixing (differential / tank-drive) ─────────────────────────────
-  CH3/CH1 normalized to -1.0 .. +1.0, dead-band at center.
+  Both manual and auto feed the SAME mixer with throttle + yaw:
     Left  wheel = Throttle + Yaw
     Right wheel = Throttle - Yaw
   Clamped to ±1.0.  Sign → direction relay, magnitude → DAC.
+
+  ─── Input sources ──────────────────────────────────────────────────
+  MANUAL (CH5 = 191):  throttle/yaw from CRSF CH3/CH1, dead man required
+  AUTO   (CH5 = 1792): throttle/yaw from AGX serial ($CMD packets)
+
+  ─── AGX serial protocol ────────────────────────────────────────────
+  Format : $CMD,<throttle>,<yaw>\n
+  Values : floats, -1.000 to +1.000
+  Rate   : 20 Hz (every 50ms)
+  Watchdog: 500ms timeout — no valid packet → agxAlive = false → stop
 
   ─── Safety chain ───────────────────────────────────────────────────
   Movement requires ALL of:
@@ -55,13 +70,15 @@
     2. ARMed          (CH8 = 1792)
     3. Manual mode    (CH5 = 191)  +  dead man pressed (CH9 = 1792)
        — OR —
-       Auto mode      (CH5 = 1792) +  AGX commands     (not yet implemented)
+       Auto mode      (CH5 = 1792) +  agxAlive (packet within 500ms)
 
   Brakes engage whenever motors are not actively driving.
   LED (CH7) is independent of arm/drive state; OFF on link loss.
 
   Fail-safe:
-    No RC link → DACs = 0, direction relays OFF, brakes ON, LED OFF.
+    No RC link    → DACs = 0, direction relays OFF, brakes ON, LED OFF.
+    AGX timeout   → DACs = 0, brakes ON (in auto mode).
+    Disarmed      → DACs = 0, brakes ON.
 */
 
 #include <Arduino.h>
@@ -79,6 +96,10 @@
 #define BRAKE_LEFT_PIN    13 // 12    // LEFT  brake relay
 #define BRAKE_RIGHT_PIN   26// 13    // RIGHT brake relay
 #define LED_RELAY_PIN     14 // 15    // LED on/off relay
+
+#define AGX_RX_PIN         4    // ESP32 RX ← AGX TX
+#define AGX_TX_PIN        33    // ESP32 TX → AGX RX (reserved for future)
+#define AGX_BAUD      115200
 
 // Set to 1 if your relay module energises on HIGH; 0 for active-LOW boards.
 #define RELAY_ACTIVE_HIGH 1
@@ -100,6 +121,9 @@
 // Toggle switch threshold (midpoint between 191/1004 and 1792)
 #define SWITCH_THRESH       1500
 
+// ─── AGX WATCHDOG ───────────────────────────────────────────────────
+#define AGX_TIMEOUT_MS      500
+
 // ─── CRSF INSTANCE ──────────────────────────────────────────────────
 CRSFforArduino crsf(&Serial2, CRSF_RX_PIN, CRSF_TX_PIN);
 
@@ -107,6 +131,59 @@ CRSFforArduino crsf(&Serial2, CRSF_RX_PIN, CRSF_TX_PIN);
 volatile bool linkIsUp = false;
 void onLinkUp()   { linkIsUp = true; }
 void onLinkDown() { linkIsUp = false; }
+
+// ─── AGX SERIAL STATE ──────────────────────────────────────────────
+static float    agxThrottle     = 0.0f;
+static float    agxYaw          = 0.0f;
+static uint32_t agxLastPacketMs = 0;
+static bool     agxAlive        = false;
+
+#define AGX_BUF_SIZE 64
+static char     agxBuf[AGX_BUF_SIZE];
+static uint8_t  agxBufIdx = 0;
+
+static void parseAGXSerial()
+{
+  while (Serial1.available())
+  {
+    char c = (char)Serial1.read();
+
+    if (c == '\n' || c == '\r')
+    {
+      if (agxBufIdx > 0)
+      {
+        agxBuf[agxBufIdx] = '\0';
+
+        if (agxBufIdx > 5 && strncmp(agxBuf, "$CMD,", 5) == 0)
+        {
+          float t, y;
+          if (sscanf(agxBuf + 5, "%f,%f", &t, &y) == 2)
+          {
+            agxThrottle     = constrain(t, -1.0f, 1.0f);
+            agxYaw          = constrain(y, -1.0f, 1.0f);
+            agxLastPacketMs = millis();
+          }
+        }
+      }
+      agxBufIdx = 0;
+    }
+    else if (agxBufIdx < AGX_BUF_SIZE - 1)
+    {
+      agxBuf[agxBufIdx++] = c;
+    }
+    else
+    {
+      agxBufIdx = 0;
+    }
+  }
+
+  agxAlive = (millis() - agxLastPacketMs < AGX_TIMEOUT_MS);
+  if (!agxAlive)
+  {
+    agxThrottle = 0.0f;
+    agxYaw      = 0.0f;
+  }
+}
 
 // ─── CONTROL STATE ──────────────────────────────────────────────────
 enum DriveMode { MODE_STOP, MODE_FWD, MODE_REV,
@@ -153,19 +230,28 @@ static Outputs computeOutputs(int ch3, int ch1, int ch5,
   // ── Can we move? ──
   bool canMove = o.armed;
   if (o.autoMode)
-    canMove = false;                   // AGX not implemented yet
+    canMove = canMove && agxAlive;       // auto needs AGX alive
   else
-    canMove = canMove && o.deadMan;    // manual needs dead man pressed
+    canMove = canMove && o.deadMan;      // manual needs dead man pressed
 
   if (!canMove)
     return o;   // brakes ON, DACs zero, direction relays OFF
 
-  // ── Differential mixing ──
-  ch3 = constrain(ch3, CRSF_MIN, CRSF_MAX);
-  ch1 = constrain(ch1, CRSF_MIN, CRSF_MAX);
+  // ── Source select + differential mixing ──
+  float throttle, yaw;
 
-  float throttle = normalizeStick(ch3);
-  float yaw      = normalizeStick(ch1);
+  if (o.autoMode)
+  {
+    throttle = agxThrottle;              // from AGX serial
+    yaw      = agxYaw;
+  }
+  else
+  {
+    ch3 = constrain(ch3, CRSF_MIN, CRSF_MAX);
+    ch1 = constrain(ch1, CRSF_MIN, CRSF_MAX);
+    throttle = normalizeStick(ch3);      // from CRSF
+    yaw      = normalizeStick(ch1);
+  }
 
   float left  = constrain(throttle + yaw, -1.0f, 1.0f);
   float right = constrain(throttle - yaw, -1.0f, 1.0f);
@@ -234,12 +320,13 @@ void setup()
   Serial.begin(115200);
   delay(500);
   Serial.println("==================================================");
-  Serial.println("ROVER — Differential Turning (RadioMaster Pocket)");
+  Serial.println("ROVER — Manual + Autonomous (RadioMaster Pocket)");
   Serial.println("==================================================");
   Serial.println("CH3/1 : throttle + yaw (tank-drive mix)");
   Serial.println("CH5   : MAN/AUTO   CH7: LED   CH8: ARM/DISARM");
   Serial.println("CH9   : dead man's switch (manual mode)");
-  Serial.println("Safety: ARM + dead man → move.  Link loss → stop.");
+  Serial.println("AUTO  : AGX serial on Serial1 ($CMD,t,y packets)");
+  Serial.println("Safety: ARM + (dead man | AGX alive) → move.");
 
   // Direction relays
   pinMode(RELAY_LEFT_PIN,  OUTPUT);
@@ -264,6 +351,11 @@ void setup()
   writeMCP4922(0, 0);
   writeMCP4922(1, 0);
 
+  // AGX serial link (Serial1)
+  Serial1.begin(AGX_BAUD, SERIAL_8N1, AGX_RX_PIN, AGX_TX_PIN);
+  Serial.printf("[OK] AGX serial on GPIO%d(RX)/GPIO%d(TX) @ %d baud\n",
+                AGX_RX_PIN, AGX_TX_PIN, AGX_BAUD);
+
   if (!crsf.begin())
   {
     Serial.println("[ERROR] CRSF init failed — check wiring on GPIO16/17");
@@ -282,6 +374,7 @@ unsigned long lastPrint = 0;
 void loop()
 {
   crsf.update();
+  parseAGXSerial();
 
   // Safe defaults: stopped, brakes on, LED off, disarmed, manual
   Outputs out = {};
@@ -332,7 +425,7 @@ void loop()
     float vL = 3.3f * out.dacLeft  / 4095.0f;
     float vR = 3.3f * out.dacRight / 4095.0f;
 
-    Serial.printf("%s %s %s [%s] L=%4u(%.2fV) R=%4u(%.2fV) dirL=%d dirR=%d brk=%d led=%d\n",
+    Serial.printf("%s %s %s [%s] L=%4u(%.2fV) R=%4u(%.2fV) dirL=%d dirR=%d brk=%d led=%d",
                   out.armed    ? "ARM " : "DSRM",
                   out.autoMode ? "AUTO" : "MAN ",
                   (!out.autoMode && out.deadMan) ? "DM" : "  ",
@@ -343,5 +436,10 @@ void loop()
                   out.relayRight ? 1 : 0,
                   out.brakeLeft ? 1 : 0,
                   out.led ? 1 : 0);
+
+    if (out.autoMode)
+      Serial.printf("  AGX:%s t=%.2f y=%.2f", agxAlive ? "OK" : "DEAD", agxThrottle, agxYaw);
+
+    Serial.println();
   }
 }
