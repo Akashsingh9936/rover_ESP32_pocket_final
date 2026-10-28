@@ -107,6 +107,8 @@
 #define I2C_SCL           22
 #define ENCODER_I2C_ADDR  0x10
 #define I2C_READ_INTERVAL 50    // request encoder data every 50ms (20 Hz)
+#define ODM_SEND_INTERVAL 50    // send $ODM to AGX every 50ms (20 Hz)
+#define STS_SEND_INTERVAL 200   // send $STS to AGX every 200ms (5 Hz)
 
 // ─── MIXER MODE ─────────────────────────────────────────────────────
 // 0 = Asymmetric: outer wheel stays at throttle, only inner wheel slows
@@ -224,6 +226,14 @@ static void readEncoderI2C()
   }
 }
 
+static uint32_t lastODMSend = 0;
+
+static void sendODM()
+{
+  Serial1.printf("$ODM,%ld,%ld,%lu\n",
+                 encData.leftTicks, encData.rightTicks, encData.timestampMs);
+}
+
 // ─── CONTROL STATE ──────────────────────────────────────────────────
 enum DriveMode { MODE_STOP, MODE_FWD, MODE_REV,
                  MODE_FWD_L, MODE_FWD_R, MODE_REV_L, MODE_REV_R,
@@ -242,6 +252,19 @@ struct Outputs {
   bool      autoMode;
   bool      deadMan;
 };
+
+// ─── STATUS TELEMETRY ──────────────────────────────────────────────
+static uint32_t lastSTSSend = 0;
+
+static void sendSTS(const Outputs &o)
+{
+  Serial1.printf("$STS,%d,%d,%d,%d,%d\n",
+                 o.autoMode ? 1 : 0,
+                 o.armed    ? 1 : 0,
+                 linkIsUp   ? 1 : 0,
+                 o.led      ? 1 : 0,
+                 o.deadMan  ? 1 : 0);
+}
 
 static float normalizeStick(int ch)
 {
@@ -454,7 +477,16 @@ void loop()
     lastI2CRead = now_i2c;
   }
 
+  // Send encoder data to AGX/RPi5 at 20 Hz
+  if (now_i2c - lastODMSend >= ODM_SEND_INTERVAL)
+  {
+    if (encConnected)
+      sendODM();
+    lastODMSend = now_i2c;
+  }
+
   // Safe defaults: stopped, brakes on, LED off, disarmed, manual
+  // (sendSTS is called after computeOutputs, below)
   Outputs out = {};
   out.drive      = MODE_STOP;
   out.brakeLeft  = true;
@@ -474,6 +506,13 @@ void loop()
   }
 
   applyOutputs(out);
+
+  // Send status telemetry to AGX at 5 Hz
+  if (millis() - lastSTSSend >= STS_SEND_INTERVAL)
+  {
+    sendSTS(out);
+    lastSTSSend = millis();
+  }
 
   unsigned long now = millis();
   if (now - lastPrint >= PRINT_INTERVAL_MS)
