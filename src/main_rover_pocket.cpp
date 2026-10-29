@@ -97,6 +97,8 @@
 #define BRAKE_LEFT_PIN    13 // 12    // LEFT  brake relay
 #define BRAKE_RIGHT_PIN   26// 13    // RIGHT brake relay
 #define LED_RELAY_PIN     14 // 15    // LED on/off relay
+#define BUZZER_PIN        19    // Buzzer (beeps in AUTO mode)
+#define BEACON_PIN        32    // Beacon light (ON when armed)
 
 #define AGX_RX_PIN         4    // ESP32 RX ← AGX TX
 #define AGX_TX_PIN        33    // ESP32 TX → AGX RX
@@ -114,6 +116,7 @@
 // 0 = Asymmetric: outer wheel stays at throttle, only inner wheel slows
 // 1 = Scaled yaw: standard mixer with reduced yaw sensitivity
 #define MIXER_MODE        0
+#define OUTER_BOOST       0.37f    // outer wheel boost fraction (MIXER_MODE 0)
 #define YAW_SCALE         0.5f    // only used when MIXER_MODE = 1
 
 // Set to 1 if your relay module energises on HIGH; 0 for active-LOW boards.
@@ -326,13 +329,13 @@ static Outputs computeOutputs(int ch3, int ch1, int ch5,
   }
   else if (yaw >= 0.0f)
   {
-    left  = throttle;
+    left  = throttle + OUTER_BOOST * yaw * (throttle >= 0.0f ? 1.0f : -1.0f);
     right = throttle - yaw * (throttle >= 0.0f ? 1.0f : -1.0f);
   }
   else
   {
     left  = throttle + yaw * (throttle >= 0.0f ? 1.0f : -1.0f);
-    right = throttle;
+    right = throttle - OUTER_BOOST * yaw * (throttle >= 0.0f ? 1.0f : -1.0f);
   }
 #else
   // Scaled yaw: standard differential mixer with reduced turn rate
@@ -435,9 +438,15 @@ void setup()
   // MCP4922 external DAC via SPI
   pinMode(DAC_CS_PIN, OUTPUT);
   digitalWrite(DAC_CS_PIN, HIGH);
-  SPI.begin();
+  SPI.begin(18, -1, 23);  // SCK=18, MISO=unused (frees GPIO19), MOSI=23
   writeMCP4922(0, 0);
   writeMCP4922(1, 0);
+
+  // Beacon and buzzer — init AFTER SPI to reclaim GPIO19 from SPI MISO
+  pinMode(BEACON_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BEACON_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
 
   // AGX serial link (Serial1)
   Serial1.begin(AGX_BAUD, SERIAL_8N1, AGX_RX_PIN, AGX_TX_PIN);
@@ -513,6 +522,15 @@ void loop()
     sendSTS(out);
     lastSTSSend = millis();
   }
+
+  // Beacon: ON when armed, OFF when disarmed or link lost
+  digitalWrite(BEACON_PIN, (linkIsUp && out.armed) ? HIGH : LOW);
+
+  // Buzzer: beep 1s ON / 1s OFF in AUTO mode only
+  if (linkIsUp && out.autoMode)
+    digitalWrite(BUZZER_PIN, ((millis() / 1000) % 2 == 0) ? HIGH : LOW);
+  else
+    digitalWrite(BUZZER_PIN, LOW);
 
   unsigned long now = millis();
   if (now - lastPrint >= PRINT_INTERVAL_MS)

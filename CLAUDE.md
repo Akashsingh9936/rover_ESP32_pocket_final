@@ -34,8 +34,12 @@ CH5 (RC switch) selects which source feeds the differential mixer at runtime. Ev
 | 13   | Left brake relay      |                                         |
 | 26   | Right brake relay     |                                         |
 | 14   | LED relay             |                                         |
+| 19   | Buzzer                | Beeps 1s ON/OFF in AUTO mode            |
+| 32   | Beacon                | ON when armed, OFF when disarmed        |
+| 21   | I2C SDA               | Encoder ESP32 (slave 0x10)              |
+| 22   | I2C SCL               | Encoder ESP32 (slave 0x10)              |
 | 4    | AGX Serial1 RX       | ESP32 receives from AGX                 |
-| 33   | AGX Serial1 TX       | ESP32 sends to AGX (reserved for future)|
+| 33   | AGX Serial1 TX       | ESP32 sends $ODM/$STS to AGX            |
 
 ### RC Channel Assignments (RadioMaster Pocket)
 
@@ -79,17 +83,20 @@ Note: PlatformIO CLI may not be in PATH. Use full path if needed: `~/.platformio
 | `computeOutputs()` | Safety gate → source select → differential mix → outputs |
 | `writeMCP4922()`   | SPI write to MCP4922 DAC channel                     |
 | `applyOutputs()`   | Write DAC values and set all relay GPIOs              |
+| `readEncoderI2C()` | I2C master request from encoder slave ESP32            |
+| `sendODM()`        | Send `$ODM,leftTicks,rightTicks,timestamp\n` to AGX   |
+| `sendSTS()`        | Send `$STS,mode,armed,rcLink,led,deadman\n` to AGX    |
 
 ### Differential Mixer
 
 Two selectable modes controlled by `#define MIXER_MODE` (0 or 1):
 
-**Mode 0 — Asymmetric (default):** Outer wheel stays at throttle, only inner wheel slows. Wider turning radius, outer wheel never overspeeds. Spin-in-place preserved when throttle = 0.
+**Mode 0 — Asymmetric (default):** Outer wheel gets throttle + 20% yaw boost (`OUTER_BOOST`), inner wheel slows. Avoids choke point at mid-throttle turns. Spin-in-place preserved when throttle = 0.
 
 ```
 Driving + turning:
-  Right turn (yaw > 0): left = throttle, right = throttle - yaw × sign(throttle)
-  Left turn  (yaw < 0): left = throttle + yaw × sign(throttle), right = throttle
+  Right turn (yaw > 0): left = throttle + OUTER_BOOST × yaw, right = throttle - yaw × sign(throttle)
+  Left turn  (yaw < 0): left = throttle + yaw × sign(throttle), right = throttle + OUTER_BOOST × |yaw|
 
 Spin in place (throttle = 0):
   left = +yaw, right = -yaw   (standard symmetric)
@@ -125,18 +132,41 @@ Throttle: -1.000 to +1.000  (negative = reverse)
 Yaw:      -1.000 to +1.000  (negative = left, positive = right)
 ```
 
-Examples:
+### Serial Protocol (ESP32 → AGX)
+
 ```
-$CMD,0.000,0.000    → stopped
-$CMD,0.500,0.000    → forward 50%, straight
-$CMD,-0.700,0.300   → reverse 70%, turning right
-$CMD,0.000,-1.000   → spin left (zero-radius)
+$ODM,<leftTicks>,<rightTicks>,<timestampMs>\n    — 20 Hz encoder odometry
+$STS,<mode>,<armed>,<rcLink>,<led>,<deadman>\n   — 5 Hz status telemetry
 ```
 
-### What's NOT Yet Implemented (AGX Side)
+| $STS Field | Values         |
+|------------|----------------|
+| mode       | 0=MANUAL, 1=AUTO |
+| armed      | 0/1            |
+| rcLink     | 0/1            |
+| led        | 0/1            |
+| deadman    | 0/1            |
 
-- **ROS2 bridge node**: Python node that subscribes to `/cmd_vel` (geometry_msgs/Twist), normalizes `linear.x` / `angular.z` to -1.0...+1.0 using calibrated `max_speed` and `max_yaw_rate`, and sends `$CMD` packets over serial
-- **Calibration values**: `max_speed` (m/s) and `max_yaw_rate` (rad/s) — measured after hardware assembly
+### ROS2 Bridge Node (AGX Side)
+
+**Status:** Implemented and tested on AGX (`~/ros2_ws/src/rover_bridge/`).
+
+Bidirectional Python bridge:
+- `/cmd_vel` → `$CMD` packets to ESP32 (20 Hz)
+- `$ODM` packets → `/odom` topic + TF broadcast (odom → base_link)
+- `$STS` packets → `/rover_status` topic
+
+Parameters: `serial_port` (/dev/ttyTHS1), `baud_rate`, `max_speed`, `max_yaw_rate`, `wheel_radius`, `wheel_base`, `ticks_per_rev` (2400)
+
+### Encoder ESP32 (I2C Slave)
+
+Separate ESP32 reads two quadrature encoders (600 PPR × 4 = 2400 counts/rev). Connected to main ESP32 via I2C (SDA=21, SCL=22, slave address 0x10). Main ESP32 polls at 20 Hz.
+
+### Calibration (NOT yet done)
+
+- `wheel_radius` — currently 0.05m (placeholder)
+- `wheel_base` — currently 0.30m (placeholder)
+- `max_speed` (m/s) and `max_yaw_rate` (rad/s) — measure after assembly
 
 ## Safety Chain
 
@@ -151,10 +181,10 @@ Movement requires ALL of:
 
 | Event              | Result                                |
 |--------------------|---------------------------------------|
-| RC link lost       | Full stop, brakes ON, LED OFF         |
-| Disarmed           | Full stop, brakes ON                  |
+| RC link lost       | Full stop, brakes ON, LED OFF, beacon OFF, buzzer OFF |
+| Disarmed           | Full stop, brakes ON, beacon OFF      |
 | AUTO + AGX timeout | Full stop, brakes ON                  |
-| CH5 → MANUAL       | Instant AGX cut, dead man required    |
+| CH5 → MANUAL       | Instant AGX cut, dead man required, buzzer OFF |
 
 ### Operator Kill Methods (always available)
 1. Disarm (CH8)
@@ -178,7 +208,9 @@ Both layers are independent. Even if the bridge crashes, the ESP32 watchdog catc
 - All safe defaults: brakes ON, DACs zero, relays OFF, LED OFF
 - AGX serial: `$CMD,<throttle>,<yaw>\n` on Serial1, 115200 baud, 500ms watchdog
 - Arm logic: `ch8 > SWITCH_THRESH` = armed (inverted from original Zorro firmware)
-- Mixer mode: `MIXER_MODE 0` = asymmetric (default), `1` = scaled yaw (`YAW_SCALE 0.5`)
+- Mixer mode: `MIXER_MODE 0` = asymmetric (default, `OUTER_BOOST 0.2`), `1` = scaled yaw (`YAW_SCALE 0.5`)
+- Beacon (GPIO 32): ON when armed, OFF when disarmed/link lost
+- Buzzer (GPIO 19): 1s ON/OFF beep in AUTO mode only (SPI MISO reassigned to -1)
 
 ## GitHub
 
@@ -197,11 +229,16 @@ Both layers are independent. Even if the bridge crashes, the ESP32 watchdog catc
 ## Project Status
 
 - [x] Manual control firmware — complete, tested with RadioMaster Pocket
-- [x] Autonomous ESP32 firmware (AGX serial parser, watchdog, source select) — implemented, compiles clean
-- [x] ROS2 bridge node — implemented (`~/ros2_ws/src/rover_bridge/`), tested on RPi5, portable to AGX
+- [x] Autonomous ESP32 firmware (AGX serial parser, watchdog, source select)
+- [x] I2C encoder integration (slave ESP32 → main ESP32, 20 Hz)
+- [x] $ODM odometry sender (ESP32 → AGX, 20 Hz)
+- [x] $STS status telemetry sender (ESP32 → AGX, 5 Hz)
+- [x] ROS2 bridge node — bidirectional, deployed and tested on AGX
+- [x] Beacon (armed indicator) and buzzer (AUTO mode alert)
+- [x] Outer wheel boost (OUTER_BOOST 0.2) for better turn response
 - [ ] Hardware assembly with final circuit
-- [ ] Calibration (max_speed, max_yaw_rate)
-- [ ] End-to-end autonomous test
+- [ ] Calibration (wheel_radius, wheel_base, max_speed, max_yaw_rate)
+- [ ] End-to-end autonomous test with Nav2
 
 ## Related
 
